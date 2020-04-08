@@ -1,4 +1,4 @@
-# H<sub>8<\sub> potential energy curve
+# H<sub>8</sub> potential energy curve
 
 To get the full curve use
 

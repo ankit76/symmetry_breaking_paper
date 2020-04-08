@@ -1,4 +1,4 @@
-# N<sub>2<\sub> potential energy curve
+# N<sub>2</sub> potential energy curve
 
 To get the full curve use
 
