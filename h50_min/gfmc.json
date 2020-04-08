@@ -1,0 +1,17 @@
+{
+  "wavefunction":
+  {
+    "name": "jastrowslater",
+    "hfType": "rhf"
+  },
+  "sampling":
+  {
+    "stochasticIter": 50000,
+    "epsilon": 1.0e-6,
+    "nwalk": 1800,
+    "tau": 0.1,
+    "ngeneration": 50,
+    "fn_factor": 0.0,
+    "maxIter": 151
+  }
+}

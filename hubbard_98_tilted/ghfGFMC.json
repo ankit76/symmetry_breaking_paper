@@ -1,0 +1,18 @@
+{
+  "hamiltonian": "hubbard",
+  "wavefunction":
+  {
+    "name": "jastrowslater",
+    "hfType": "ghf",
+    "complex": true
+  },
+  "sampling":
+  {
+    "stochasticIter": 70000,
+    "nwalk": 2500,
+    "tau": 0.1,
+    "ngeneration": 50,
+    "fn_factor": 0.0,
+    "maxIter": 301
+  }
+}

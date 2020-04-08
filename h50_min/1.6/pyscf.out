@@ -1,0 +1,510 @@
+#INFO: **** input file is /projects/anma2640/VMC/VMC_tests/symmetry_breaking_paper/h50_min/prepVMC.py ****
+import numpy as np
+import math
+from pyscf import gto, scf, ao2mo, mcscf, tools, fci, mp
+#from pyscf.shciscf import shci, settings
+from pyscf import lo
+from pyscf.lo import pipek, boys, edmiston, iao, ibo
+import sys
+from scipy.linalg import fractional_matrix_power
+from scipy.stats import ortho_group
+import scipy.linalg as la
+
+def doRHF(mol):
+  mf = scf.RHF(mol)
+  print(mf.kernel())
+  return mf
+
+#it may be necessary (more often than not) to provide a system curated initial guess for the dm rather than just adding noise
+#if using noise, changing its magnitude may change the final answer as well
+def doUHF(mol, dm=None):
+  umf = scf.UHF(mol)
+  if dm is None:
+    dm = umf.get_init_guess()
+    norb = mol.nao
+    dm[0] = dm[0] + np.random.rand(norb, norb) / 2
+    dm[1] = dm[1] + np.random.rand(norb, norb) / 2
+  print(umf.kernel(dm0 = dm))
+  return umf
+
+#it may be necessary (more often than not) to provide a system curated initial guess for the dm rather than just adding noise
+#if using noise, changing its magnitude may change the final answer as well
+def doGHF(mol, dm=None):
+  gmf = scf.GHF(mol)
+  gmf.max_cycle = 200
+  if dm is None:
+    dm = gmf.get_init_guess()
+    norb = mol.nao
+    dm = dm + np.random.rand(2*norb, 2*norb) / 3
+  print(gmf.kernel(dm0 = dm))
+  return gmf
+
+def localizeAllElectron(mf, method="lowdin"):
+  if (method == "lowdin"):
+    return fractional_matrix_power(mf.get_ovlp(), -0.5).T
+  elif (method == "pm"):
+    return pipek.PM(mf.mol).kernel(mf.mo_coeff)
+  elif (method == "boys"):
+    return boys.Boys(mf.mol).kernel(mf.mo_coeff)
+  elif (method == "er"):
+    return edmiston.ER(mf.mol).kernel(mf.mo_coeff)
+  elif (method == "iao"):
+    return iao.iao(mf.mol, mf.mo_coeff)
+  elif (method == "ibo"):
+    a = iao.iao(mf.mol, mf.mo_coeff)
+    a = lo.vec_lowdin(a, mf.get_ovlp())
+    return ibo.ibo(mf.mol, mf.mo_coeff, iaos=a)
+
+def localizeValence(mf, mo_coeff, method="iao"):
+  if (method == "iao"):
+    return iao.iao(mf.mol, mo_coeff)
+  elif (method == "ibo"):
+    a = iao.iao(mf.mol, mo_coeff)
+    a = lo.vec_lowdin(a, mf.get_ovlp())
+    return ibo.ibo(mf.mol, mo_coeff, iaos=a)
+  elif (method == "boys"):
+    return boys.Boys(mf.mol).kernel(mo_coeff)
+  elif (method == "er"):
+    return edmiston.ER(mf.mol).kernel(mo_coeff)
+
+# can be used for all electron, but not recommended
+def bestDetValence(mol, lmo, occ, eri, writeToFile=True):
+  maxLMOContributers = [ np.argmax(np.abs(lmo[::,i])) for i in range(lmo.shape[1]) ]  # index of the ao contributing the most to an lmo
+  atomNumAOs = [ i[1][3] - 1 for i in enumerate(mol.aoslice_nr_by_atom()) ]  # end AO index for each atom in ascending order
+  lmoSites = [ [] for i in range(mol.natm) ] #lmo's cetered on each atom
+  for i in enumerate(maxLMOContributers):
+    lmoSites[np.searchsorted(np.array(atomNumAOs), i[1])].append(i[0])
+
+  bestDet = [0 for i in range(lmo.shape[1])]
+  def pair(i):
+    return i*(i+1)//2+i
+  for i in enumerate(occ):
+    if eri.ndim == 2:
+      onSiteIntegrals = [ (j, eri[pair(j),pair(j)]) for (n,j) in enumerate(lmoSites[i[0]]) ]
+    elif eri.ndim == 1:
+      onSiteIntegrals = [ (j, eri[pair(pair(j))]) for (n,j) in enumerate(lmoSites[i[0]]) ]
+    onSiteIntegrals.sort(key = lambda tup : tup[1], reverse=True)
+    for k in range(i[1][0]):
+      bestDet[onSiteIntegrals[k][0]] = '2'
+    for l in range(i[1][1]):
+      bestDet[onSiteIntegrals[i[1][0] + l][0]] = 'a'
+    for m in range(i[1][2]):
+      bestDet[onSiteIntegrals[i[1][0] + i[1][1] + m][0]] = 'b'
+
+  bestDetStr = '  '.join(bestDet)
+  print('bestDet:  ' + bestDetStr)
+  if writeToFile:
+    fileh = open("bestDet", 'w')
+    fileh.write('1.   ' + bestDetStr + '\n')
+    fileh.close()
+
+  return bestDetStr
+
+def writeFCIDUMP(mol, mf, lmo):
+  h1 = lmo.T.dot(mf.get_hcore()).dot(lmo)
+  eri = ao2mo.kernel(mol, lmo)
+  tools.fcidump.from_integrals('FCIDUMP', h1, eri, mol.nao, mol.nelectron, mf.energy_nuc())
+
+def basisChange(matAO, lmo, ovlp):
+  matMO = (matAO.T.dot(ovlp).dot(lmo)).T
+  return matMO
+
+def writeMat(mat, fileName, isComplex):
+  fileh = open(fileName, 'w')
+  for i in range(mat.shape[0]):
+      for j in range(mat.shape[1]):
+        if (isComplex):
+          fileh.write('(%16.10e, %16.10e) '%(mat[i,j].real, mat[i,j].imag))
+        else:
+          fileh.write('%16.10e '%(mat[i,j]))
+      fileh.write('\n')
+  fileh.close()
+
+def readMat(fileName, shape, isComplex):
+  if(isComplex):
+    matr = np.zeros(shape)
+    mati = np.zeros(shape)
+  else:
+    mat = np.zeros(shape)
+  row = 0
+  fileh = open(fileName, 'r')
+  for line in fileh:
+    col = 0
+    for coeff in line.split():
+      if (isComplex):
+        m = coeff.strip()[1:-1]
+        matr[row, col], mati[row, col] = [float(x) for x in m.split(',')]
+      else:
+        mat[row, col]  = float(coeff)
+      col = col + 1
+    row = row + 1
+  fileh.close()
+  if (isComplex):
+    mat = matr + 1j * mati
+  return mat
+
+def makeAGPFromRHF(rhfCoeffs):
+  norb = rhfCoeffs.shape[0]
+  nelec = 2*rhfCoeffs.shape[1]
+  diag = np.eye(nelec//2)
+  #diag = np.zeros((norb,norb))
+  #for i in range(nelec/2):
+  #  diag[i,i] = 1.
+  pairMat = rhfCoeffs.dot(diag).dot(rhfCoeffs.T)
+  return pairMat
+
+def makePfaffFromGHF(ghfCoeffs):
+  nelec = ghfCoeffs.shape[1]
+  amat = np.full((nelec, nelec), 0.)
+  for i in range(nelec//2):
+    amat[2 * i + 1, 2 * i] = -1.
+    amat[2 * i, 2 * i + 1] = 1.
+  pairMat = ghfCoeffs.dot(amat).dot(ghfCoeffs.T)
+  return pairMat
+
+def addNoise(mat, isComplex, prefac = 0.01):
+  if (isComplex):
+    randMat = prefac * (np.random.rand(mat.shape[0], mat.shape[1]) + 1j * np.random.rand(mat.shape[0], mat.shape[1]))
+    return mat + randMat
+  else:
+    randMat = prefac * np.random.rand(mat.shape[0], mat.shape[1])
+    return mat + randMat
+
+def prepAllElectron(mol, loc="lowdin", dm=None, writeFcidump=True, writeMOs=True):
+  mf = doRHF(mol)
+  lmo = localizeAllElectron(mf, loc)
+  if writeFcidump:
+    writeFCIDUMP(mol, mf, lmo)
+  gmf = doGHF(mol, dm)
+  overlap = mf.get_ovlp(mol)
+  ghfCoeffs = basisChange(gmf.mo_coeff, la.block_diag(lmo, lmo), la.block_diag(overlap, overlap))
+  if writeMOs:
+    writeMat(ghfCoeffs, "hf.txt", False)
+
+def prepValence(mol, ncore, nact, occ=None, loc="iao", dm=None, writeFcidump=True, writeMolden=False, writeBestDet=True, writeMOs=True):
+  mf = doRHF(mol)
+  mo = mf.mo_coeff
+  lmo = localizeValence(mf, mo[:,ncore:ncore+nact], loc)
+  if writeMolden:
+    tools.molden.from_mo(mol, 'valenceOrbs.molden', lmo)
+
+  nelec = mol.nelectron - 2 * ncore
+  mc = mcscf.CASSCF(mf, nact, nelec)
+  h1cas, energy_core = mcscf.casci.h1e_for_cas(mc, mf.mo_coeff, nact, ncore)
+  mo_core = mc.mo_coeff[:,:ncore]
+  core_dm = 2 * mo_core.dot(mo_core.T)
+  corevhf = mc.get_veff(mol, core_dm)
+  h1eff = lmo.T.dot(mc.get_hcore() + corevhf).dot(lmo)
+  eri = ao2mo.kernel(mol, lmo)
+  if writeFcidump:
+    tools.fcidump.from_integrals('FCIDUMP', h1eff, eri, nact, nelec, energy_core)
+  if occ is not None:
+    bestDetValence(mol, lmo, occ, eri, writeBestDet)
+
+  # make fictitious valence only molecule and perform ghf
+  norb = nact
+  molA = gto.M()
+  molA.nelectron = nelec
+  molA.verbose = 4
+  molA.incore_anyway = True
+  gmf = scf.GHF(molA)
+  gmf.get_hcore = lambda *args: la.block_diag(h1eff, h1eff)
+  gmf.get_ovlp = lambda *args: np.identity(2*norb)
+  gmf.energy_nuc = lambda *args: energy_core
+  gmf._eri = eri
+  if dm is None:
+    dm = gmf.get_init_guess()
+    dm = dm + 2 * np.random.rand(2*norb, 2*norb)
+  gmf.level_shift = 0.1
+  gmf.max_cycle = 500
+  print(gmf.kernel(dm0 = dm))
+  if writeMOs:
+    writeMat(gmf.mo_coeff, "hf.txt", False)
+
+
+if __name__=="__main__":
+  # make your molecule here
+  r = float(sys.argv[1])
+  atomstring = ""
+  for i in range(50):
+    atomstring += "H 0 0 %g\n"%(i*r)
+  mol = gto.M(
+      atom = atomstring,
+      basis = 'sto-6g',
+      verbose = 4,
+      unit = 'bohr',
+      symmetry = 0,
+      spin = 0)
+  mf = doRHF(mol)
+  lmo = localizeAllElectron(mf, "lowdin")
+  writeFCIDUMP(mol, mf, lmo)
+
+  # initial det to start vmc run with
+  fileh = open("bestDet", 'w')
+  fileh.write('1.   '+''.join(['a ' if i%2 == 0 else 'b ' for i in range(50)]))
+  fileh.close()
+
+  # rhf
+  overlap = mf.get_ovlp(mol)
+  rhfCoeffs = basisChange(mf.mo_coeff, lmo, overlap)
+  writeMat(rhfCoeffs, "rhf.txt", False)
+
+  # agp
+  theta = rhfCoeffs[::, :mol.nelectron//2]
+  pairMat = makeAGPFromRHF(theta)
+  writeMat(pairMat, "agp.txt", False)
+
+  # uhf
+  dm = [np.zeros((50,50)), np.zeros((50,50))]
+  for i in range(mol.nao//2):
+    dm[0][2*i, 2*i] = 1.
+    dm[1][2*i+1, 2*i+1] = 1.
+  umf = doUHF(mol, dm)
+  uhfCoeffs = np.empty((mol.nao, 2*mol.nao))
+  uhfCoeffs[::,:mol.nao] = basisChange(umf.mo_coeff[0], lmo, overlap)
+  uhfCoeffs[::,mol.nao:] = basisChange(umf.mo_coeff[1], lmo, overlap)
+  writeMat(uhfCoeffs, "uhf.txt", False)
+
+  # ghf
+  dmg = la.block_diag(dm[0], dm[1])
+  gmf = doGHF(mol, dmg)
+  ghfCoeffs = basisChange(gmf.mo_coeff, la.block_diag(lmo, lmo), la.block_diag(overlap, overlap))
+  writeMat(addNoise(ghfCoeffs, False), "ghf.txt", False)
+
+  # pfaffian
+  theta = ghfCoeffs[::, :mol.nelectron]
+  pairMat = makePfaffFromGHF(theta)
+  writeMat(pairMat, "pfaffian.txt", False)
+#INFO: ******************** input file end ********************
+
+
+System: uname_result(system='Linux', node='shas0835.rc.int.colorado.edu', release='3.10.0-957.21.3.el7.x86_64', version='#1 SMP Tue Jun 18 16:35:19 UTC 2019', machine='x86_64', processor='x86_64')  Threads 24
+Python 3.6.10 |Anaconda, Inc.| (default, Jan  7 2020, 21:14:29) 
+[GCC 7.3.0]
+numpy 1.18.1  scipy 1.4.1
+Date: Tue Apr  7 22:59:10 2020
+PySCF version 1.7.0
+PySCF path  /projects/anma2640/conda_envs/python3/lib/python3.6/site-packages/pyscf
+
+[CONFIG] conf_file None
+[INPUT] verbose = 4
+[INPUT] num. atoms = 50
+[INPUT] num. electrons = 50
+[INPUT] charge = 0
+[INPUT] spin (= nelec alpha-beta = 2S) = 0
+[INPUT] symmetry 0 subgroup None
+[INPUT] Mole.unit = bohr
+[INPUT]  1 H      0.000000000000   0.000000000000   0.000000000000 AA    0.000000000000   0.000000000000   0.000000000000 Bohr
+[INPUT]  2 H      0.000000000000   0.000000000000   0.846683537472 AA    0.000000000000   0.000000000000   1.600000000000 Bohr
+[INPUT]  3 H      0.000000000000   0.000000000000   1.693367074944 AA    0.000000000000   0.000000000000   3.200000000000 Bohr
+[INPUT]  4 H      0.000000000000   0.000000000000   2.540050612416 AA    0.000000000000   0.000000000000   4.800000000000 Bohr
+[INPUT]  5 H      0.000000000000   0.000000000000   3.386734149888 AA    0.000000000000   0.000000000000   6.400000000000 Bohr
+[INPUT]  6 H      0.000000000000   0.000000000000   4.233417687360 AA    0.000000000000   0.000000000000   8.000000000000 Bohr
+[INPUT]  7 H      0.000000000000   0.000000000000   5.080101224832 AA    0.000000000000   0.000000000000   9.600000000000 Bohr
+[INPUT]  8 H      0.000000000000   0.000000000000   5.926784762304 AA    0.000000000000   0.000000000000  11.200000000000 Bohr
+[INPUT]  9 H      0.000000000000   0.000000000000   6.773468299776 AA    0.000000000000   0.000000000000  12.800000000000 Bohr
+[INPUT] 10 H      0.000000000000   0.000000000000   7.620151837248 AA    0.000000000000   0.000000000000  14.400000000000 Bohr
+[INPUT] 11 H      0.000000000000   0.000000000000   8.466835374720 AA    0.000000000000   0.000000000000  16.000000000000 Bohr
+[INPUT] 12 H      0.000000000000   0.000000000000   9.313518912192 AA    0.000000000000   0.000000000000  17.600000000000 Bohr
+[INPUT] 13 H      0.000000000000   0.000000000000  10.160202449664 AA    0.000000000000   0.000000000000  19.200000000000 Bohr
+[INPUT] 14 H      0.000000000000   0.000000000000  11.006885987136 AA    0.000000000000   0.000000000000  20.800000000000 Bohr
+[INPUT] 15 H      0.000000000000   0.000000000000  11.853569524608 AA    0.000000000000   0.000000000000  22.400000000000 Bohr
+[INPUT] 16 H      0.000000000000   0.000000000000  12.700253062080 AA    0.000000000000   0.000000000000  24.000000000000 Bohr
+[INPUT] 17 H      0.000000000000   0.000000000000  13.546936599552 AA    0.000000000000   0.000000000000  25.600000000000 Bohr
+[INPUT] 18 H      0.000000000000   0.000000000000  14.393620137024 AA    0.000000000000   0.000000000000  27.200000000000 Bohr
+[INPUT] 19 H      0.000000000000   0.000000000000  15.240303674496 AA    0.000000000000   0.000000000000  28.800000000000 Bohr
+[INPUT] 20 H      0.000000000000   0.000000000000  16.086987211968 AA    0.000000000000   0.000000000000  30.400000000000 Bohr
+[INPUT] 21 H      0.000000000000   0.000000000000  16.933670749440 AA    0.000000000000   0.000000000000  32.000000000000 Bohr
+[INPUT] 22 H      0.000000000000   0.000000000000  17.780354286912 AA    0.000000000000   0.000000000000  33.600000000000 Bohr
+[INPUT] 23 H      0.000000000000   0.000000000000  18.627037824384 AA    0.000000000000   0.000000000000  35.200000000000 Bohr
+[INPUT] 24 H      0.000000000000   0.000000000000  19.473721361856 AA    0.000000000000   0.000000000000  36.800000000000 Bohr
+[INPUT] 25 H      0.000000000000   0.000000000000  20.320404899328 AA    0.000000000000   0.000000000000  38.400000000000 Bohr
+[INPUT] 26 H      0.000000000000   0.000000000000  21.167088436800 AA    0.000000000000   0.000000000000  40.000000000000 Bohr
+[INPUT] 27 H      0.000000000000   0.000000000000  22.013771974272 AA    0.000000000000   0.000000000000  41.600000000000 Bohr
+[INPUT] 28 H      0.000000000000   0.000000000000  22.860455511744 AA    0.000000000000   0.000000000000  43.200000000000 Bohr
+[INPUT] 29 H      0.000000000000   0.000000000000  23.707139049216 AA    0.000000000000   0.000000000000  44.800000000000 Bohr
+[INPUT] 30 H      0.000000000000   0.000000000000  24.553822586688 AA    0.000000000000   0.000000000000  46.400000000000 Bohr
+[INPUT] 31 H      0.000000000000   0.000000000000  25.400506124160 AA    0.000000000000   0.000000000000  48.000000000000 Bohr
+[INPUT] 32 H      0.000000000000   0.000000000000  26.247189661632 AA    0.000000000000   0.000000000000  49.600000000000 Bohr
+[INPUT] 33 H      0.000000000000   0.000000000000  27.093873199104 AA    0.000000000000   0.000000000000  51.200000000000 Bohr
+[INPUT] 34 H      0.000000000000   0.000000000000  27.940556736576 AA    0.000000000000   0.000000000000  52.800000000000 Bohr
+[INPUT] 35 H      0.000000000000   0.000000000000  28.787240274048 AA    0.000000000000   0.000000000000  54.400000000000 Bohr
+[INPUT] 36 H      0.000000000000   0.000000000000  29.633923811520 AA    0.000000000000   0.000000000000  56.000000000000 Bohr
+[INPUT] 37 H      0.000000000000   0.000000000000  30.480607348992 AA    0.000000000000   0.000000000000  57.600000000000 Bohr
+[INPUT] 38 H      0.000000000000   0.000000000000  31.327290886464 AA    0.000000000000   0.000000000000  59.200000000000 Bohr
+[INPUT] 39 H      0.000000000000   0.000000000000  32.173974423936 AA    0.000000000000   0.000000000000  60.800000000000 Bohr
+[INPUT] 40 H      0.000000000000   0.000000000000  33.020657961408 AA    0.000000000000   0.000000000000  62.400000000000 Bohr
+[INPUT] 41 H      0.000000000000   0.000000000000  33.867341498880 AA    0.000000000000   0.000000000000  64.000000000000 Bohr
+[INPUT] 42 H      0.000000000000   0.000000000000  34.714025036352 AA    0.000000000000   0.000000000000  65.600000000000 Bohr
+[INPUT] 43 H      0.000000000000   0.000000000000  35.560708573824 AA    0.000000000000   0.000000000000  67.200000000000 Bohr
+[INPUT] 44 H      0.000000000000   0.000000000000  36.407392111296 AA    0.000000000000   0.000000000000  68.800000000000 Bohr
+[INPUT] 45 H      0.000000000000   0.000000000000  37.254075648768 AA    0.000000000000   0.000000000000  70.400000000000 Bohr
+[INPUT] 46 H      0.000000000000   0.000000000000  38.100759186240 AA    0.000000000000   0.000000000000  72.000000000000 Bohr
+[INPUT] 47 H      0.000000000000   0.000000000000  38.947442723712 AA    0.000000000000   0.000000000000  73.600000000000 Bohr
+[INPUT] 48 H      0.000000000000   0.000000000000  39.794126261184 AA    0.000000000000   0.000000000000  75.200000000000 Bohr
+[INPUT] 49 H      0.000000000000   0.000000000000  40.640809798656 AA    0.000000000000   0.000000000000  76.800000000000 Bohr
+[INPUT] 50 H      0.000000000000   0.000000000000  41.487493336128 AA    0.000000000000   0.000000000000  78.400000000000 Bohr
+
+nuclear repulsion = 109.350166822795
+number of shells = 50
+number of NR pGTOs = 300
+number of NR cGTOs = 50
+basis = sto-6g
+ecp = {}
+CPU time:         3.23
+
+
+******** <class 'pyscf.scf.hf.RHF'> ********
+method = RHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/summit/anma2640/tmpd7cuqdyw
+max_memory 4000 MB (current use 69 MB)
+Set gradient conv threshold to 3.16228e-05
+init E= -24.4437729476215
+  HOMO = -0.0031943315465451  LUMO = 0.0602207856727198
+cycle= 1 E= -26.0154961088458  delta_E= -1.57  |g|= 0.145  |ddm|= 5.69
+  HOMO = -0.078664592456155  LUMO = 0.0612483492309847
+cycle= 2 E= -26.0425665285212  delta_E= -0.0271  |g|= 0.0857  |ddm|= 0.683
+  HOMO = -0.0895589228017515  LUMO = 0.083802061880297
+cycle= 3 E= -26.0565216225587  delta_E= -0.014  |g|= 0.0481  |ddm|= 0.557
+  HOMO = -0.106198692810907  LUMO = 0.0994935522454403
+cycle= 4 E= -26.0617930013205  delta_E= -0.00527  |g|= 0.0158  |ddm|= 0.457
+  HOMO = -0.109868244097703  LUMO = 0.102401604882521
+cycle= 5 E= -26.062198725675  delta_E= -0.000406  |g|= 0.00518  |ddm|= 0.105
+  HOMO = -0.111448114407305  LUMO = 0.104715263477034
+cycle= 6 E= -26.0622508335935  delta_E= -5.21e-05  |g|= 0.0012  |ddm|= 0.0457
+  HOMO = -0.111948835232463  LUMO = 0.105072809501436
+cycle= 7 E= -26.0622529897343  delta_E= -2.16e-06  |g|= 0.000308  |ddm|= 0.0103
+  HOMO = -0.111911611711076  LUMO = 0.10500251306315
+cycle= 8 E= -26.0622531053529  delta_E= -1.16e-07  |g|= 6.91e-05  |ddm|= 0.00175
+  HOMO = -0.11191843151484  LUMO = 0.105009003670431
+cycle= 9 E= -26.0622531107385  delta_E= -5.39e-09  |g|= 1.54e-05  |ddm|= 0.000362
+  HOMO = -0.111923909590224  LUMO = 0.105009499463495
+cycle= 10 E= -26.0622531109685  delta_E= -2.3e-10  |g|= 3.88e-06  |ddm|= 7.89e-05
+  HOMO = -0.111923779555181  LUMO = 0.105008706073448
+Extra cycle  E= -26.0622531109814  delta_E= -1.29e-11  |g|= 1.71e-06  |ddm|= 1.33e-05
+converged SCF energy = -26.0622531109814
+-26.062253110981445
+
+
+******** <class 'pyscf.scf.uhf.UHF'> ********
+method = UHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 50
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/summit/anma2640/tmp49xuft23
+max_memory 4000 MB (current use 190 MB)
+number electrons alpha = 25  beta = 25
+Set gradient conv threshold to 3.16228e-05
+init E= -25.7971531752848
+  alpha nocc = 25  HOMO = -0.226900004478903  LUMO = 0.351996705490289
+  beta  nocc = 25  HOMO = -0.226900004478904  LUMO = 0.351996705490289
+cycle= 1 E= -25.64187520508  delta_E= 0.155  |g|= 0.63  |ddm|= 3.71
+  alpha nocc = 25  HOMO = -0.261221834306585  LUMO = 0.275081815645111
+  beta  nocc = 25  HOMO = -0.261221834306584  LUMO = 0.27508181564511
+cycle= 2 E= -25.9783818184246  delta_E= -0.337  |g|= 0.297  |ddm|= 0.971
+  alpha nocc = 25  HOMO = -0.200848496370529  LUMO = 0.202235911002174
+  beta  nocc = 25  HOMO = -0.200848496370529  LUMO = 0.202235911002177
+cycle= 3 E= -26.1144201459457  delta_E= -0.136  |g|= 0.0646  |ddm|= 0.992
+  alpha nocc = 25  HOMO = -0.171787886036536  LUMO = 0.171277131624852
+  beta  nocc = 25  HOMO = -0.171787886036536  LUMO = 0.171277131624853
+cycle= 4 E= -26.1285925225812  delta_E= -0.0142  |g|= 0.0158  |ddm|= 0.471
+  alpha nocc = 25  HOMO = -0.16937051754491  LUMO = 0.166384665262088
+  beta  nocc = 25  HOMO = -0.169370517544911  LUMO = 0.166384665262091
+cycle= 5 E= -26.1297864533399  delta_E= -0.00119  |g|= 0.00864  |ddm|= 0.132
+  alpha nocc = 25  HOMO = -0.170262721609716  LUMO = 0.167506106033776
+  beta  nocc = 25  HOMO = -0.170262721609714  LUMO = 0.16750610603378
+cycle= 6 E= -26.1301476115918  delta_E= -0.000361  |g|= 0.00344  |ddm|= 0.0864
+  alpha nocc = 25  HOMO = -0.17093800355469  LUMO = 0.167340195757886
+  beta  nocc = 25  HOMO = -0.17093800355469  LUMO = 0.167340195757885
+cycle= 7 E= -26.1301816239732  delta_E= -3.4e-05  |g|= 0.0012  |ddm|= 0.0209
+  alpha nocc = 25  HOMO = -0.170992958895243  LUMO = 0.167443647768351
+  beta  nocc = 25  HOMO = -0.170992958895243  LUMO = 0.167443647768353
+cycle= 8 E= -26.130186946625  delta_E= -5.32e-06  |g|= 0.000403  |ddm|= 0.00999
+  alpha nocc = 25  HOMO = -0.171005420892646  LUMO = 0.167454129927381
+  beta  nocc = 25  HOMO = -0.171005420892645  LUMO = 0.167454129927384
+cycle= 9 E= -26.1301874796005  delta_E= -5.33e-07  |g|= 0.000117  |ddm|= 0.00376
+  alpha nocc = 25  HOMO = -0.171037858939849  LUMO = 0.167458064117777
+  beta  nocc = 25  HOMO = -0.171037858939847  LUMO = 0.167458064117778
+cycle= 10 E= -26.1301875118535  delta_E= -3.23e-08  |g|= 4.3e-05  |ddm|= 0.000565
+  alpha nocc = 25  HOMO = -0.171043355354512  LUMO = 0.167460174533072
+  beta  nocc = 25  HOMO = -0.171043355354513  LUMO = 0.167460174533076
+cycle= 11 E= -26.1301875168092  delta_E= -4.96e-09  |g|= 1.67e-05  |ddm|= 0.000247
+  alpha nocc = 25  HOMO = -0.171040820510257  LUMO = 0.167455353867174
+  beta  nocc = 25  HOMO = -0.171040820510256  LUMO = 0.167455353867177
+cycle= 12 E= -26.1301875180051  delta_E= -1.2e-09  |g|= 6.25e-06  |ddm|= 0.000147
+  alpha nocc = 25  HOMO = -0.171040707784658  LUMO = 0.167454398139299
+  beta  nocc = 25  HOMO = -0.171040707784658  LUMO = 0.167454398139302
+cycle= 13 E= -26.1301875181883  delta_E= -1.83e-10  |g|= 2.77e-06  |ddm|= 6.64e-05
+  alpha nocc = 25  HOMO = -0.171040839887483  LUMO = 0.167454591628343
+  beta  nocc = 25  HOMO = -0.171040839887484  LUMO = 0.167454591628346
+Extra cycle  E= -26.1301875182069  delta_E= -1.86e-11  |g|= 1.92e-06  |ddm|= 9.93e-06
+converged SCF energy = -26.1301875182069  <S^2> = 2.3721142  2S+1 = 3.2385887
+-26.13018751820691
+
+
+******** <class 'pyscf.scf.ghf.GHF'> ********
+method = GHF
+initial guess = minao
+damping factor = 0
+level_shift factor = 0
+DIIS = <class 'pyscf.scf.diis.CDIIS'>
+diis_start_cycle = 1
+diis_space = 8
+SCF conv_tol = 1e-09
+SCF conv_tol_grad = None
+SCF max_cycles = 200
+direct_scf = True
+direct_scf_tol = 1e-13
+chkfile to save SCF result = /scratch/summit/anma2640/tmpngjhd18d
+max_memory 4000 MB (current use 193 MB)
+Set gradient conv threshold to 3.16228e-05
+init E= -25.7971531752847
+  HOMO = -0.226900004478903  LUMO = 0.351996705490288
+cycle= 1 E= -25.6418752050803  delta_E= 0.155  |g|= 0.63  |ddm|= 3.71
+  HOMO = -0.261221834306585  LUMO = 0.275081815645109
+cycle= 2 E= -25.9783818184245  delta_E= -0.337  |g|= 0.297  |ddm|= 0.971
+  HOMO = -0.200848496370526  LUMO = 0.202235911002178
+cycle= 3 E= -26.1144201459457  delta_E= -0.136  |g|= 0.0646  |ddm|= 0.992
+  HOMO = -0.171787886036541  LUMO = 0.171277131624848
+cycle= 4 E= -26.1285925225808  delta_E= -0.0142  |g|= 0.0158  |ddm|= 0.471
+  HOMO = -0.169370517544907  LUMO = 0.166384665262094
+cycle= 5 E= -26.1297864533399  delta_E= -0.00119  |g|= 0.00864  |ddm|= 0.132
+  HOMO = -0.170262721609726  LUMO = 0.167506106033788
+cycle= 6 E= -26.130147611592  delta_E= -0.000361  |g|= 0.00344  |ddm|= 0.0864
+  HOMO = -0.170938003554682  LUMO = 0.167340195757886
+cycle= 7 E= -26.1301816239731  delta_E= -3.4e-05  |g|= 0.0012  |ddm|= 0.0209
+  HOMO = -0.170992958895232  LUMO = 0.167443647768366
+cycle= 8 E= -26.130186946625  delta_E= -5.32e-06  |g|= 0.000403  |ddm|= 0.00999
+  HOMO = -0.171005420892628  LUMO = 0.167454129927371
+cycle= 9 E= -26.1301874796004  delta_E= -5.33e-07  |g|= 0.000117  |ddm|= 0.00376
+  HOMO = -0.171037858939849  LUMO = 0.167458064117778
+cycle= 10 E= -26.1301875118534  delta_E= -3.23e-08  |g|= 4.3e-05  |ddm|= 0.000565
+  HOMO = -0.171043355354512  LUMO = 0.167460174533074
+cycle= 11 E= -26.1301875168091  delta_E= -4.96e-09  |g|= 1.67e-05  |ddm|= 0.000247
+  HOMO = -0.171040820510253  LUMO = 0.167455353867179
+cycle= 12 E= -26.1301875180052  delta_E= -1.2e-09  |g|= 6.25e-06  |ddm|= 0.000147
+  HOMO = -0.171040707784661  LUMO = 0.167454398139296
+cycle= 13 E= -26.1301875181883  delta_E= -1.83e-10  |g|= 2.77e-06  |ddm|= 6.64e-05
+  HOMO = -0.171040839887482  LUMO = 0.167454591628346
+Extra cycle  E= -26.1301875182069  delta_E= -1.87e-11  |g|= 1.92e-06  |ddm|= 9.93e-06
+converged SCF energy = -26.1301875182069  <S^2> = 2.3721142  2S+1 = 3.2385887
+-26.130187518206938

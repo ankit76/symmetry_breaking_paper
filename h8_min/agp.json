@@ -1,0 +1,20 @@
+{
+  "wavefunction":
+  {
+    "name": "jastrowagp"
+  },
+  "sampling":
+  {
+    "deterministic": true,
+    "epsilon": 1.0e-6
+  },
+  "optimizer":
+  {
+    "method": "amsgrad",
+    "maxIter": 1000,
+    "stepsize": 0.005,
+    "decay1": 0.1,
+    "decay2": 0.01,
+    "optimizeCps": false
+  }
+}
